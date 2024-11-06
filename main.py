@@ -6,6 +6,7 @@ import numpy as np
 import itertools
 import copy
 import threading
+import os
 from pyparrot.Bebop import Bebop
 from Model.Keypoint_classifier import KeyPointClassifier
 
@@ -38,18 +39,6 @@ class VideoStream:
         self.stopped = True
         self.stream.release()
 
-# Initialize drone connection and state
-bebop = Bebop()
-print("Connecting")
-if bebop.connect(10):
-    print("Success")
-else: 
-    print ("Failure")
-
-print("Sleeping")
-bebop.smart_sleep(5)
-bebop.ask_for_state_update()
-
 # Cooldown Period between inputs
 takeoff_cooldown = 1.0  # Reduced to 1 second for faster response
 last_takeoff_time = 0
@@ -59,14 +48,8 @@ landing_start_time = 0 #Track the time when landing is initiated
 
 # Define landing range (in cm)
 landing_range = 50  # Change this value based on your needs
+PrevHandSign = -1
 
-def Get_number_pressed(key, Training):
-    number = -1
-    if 48 <= key <= 57:  # 0 ~ 9
-        number = key - 48
-    if key == 116:  # t
-        Training = True
-    return number,  Training
 
   # Read labels ###########################################################
 with open('Model/keypoint_classifier_label.csv',
@@ -77,11 +60,33 @@ with open('Model/keypoint_classifier_label.csv',
         ]
 
 # Functions for landmark processing, bounding boxes, and gestures --------------
+def Get_number_pressed(key, Training):
 
-def logging_csv(number, Training, landmark_list):
-    if not Training:
-        pass
-    if Training and (0 <= number <= 9):
+    number = -1
+    if 48 <= key <= 57:  # 0 ~ 9
+        number = key - 48
+    if key == 116:  # t
+        Training =  not Training
+    return number,  Training
+
+def Initialize_drone ():
+    # Initialize drone connection and state
+    bebop = Bebop()
+    print("Connecting")
+
+    if bebop.connect(10):
+        print("Success")
+    else: 
+        print ("Failure")
+
+    print("Sleeping")
+    bebop.smart_sleep(5)
+    bebop.ask_for_state_update()
+    return bebop
+
+def logging_csv(number, landmark_list):
+    
+    if  (0 <= number <= 9):
         csv_path = 'Model/keypoint.csv'
         with open(csv_path, 'a', newline="") as f:
             writer = csv.writer(f)
@@ -135,12 +140,12 @@ def draw_bounding_rect(image, brect, Training):
         else:
             cv2.rectangle(image, (brect[0], brect[1]), (brect[2], brect[3]), (255, 0, 0), 1)
 
-
-def side(processed_landmark_list, classifier, bebop, current_time):
+def side(processed_landmark_list, classifier, bebop, current_time, Training):
     hand_sign_id = classifier(processed_landmark_list)
-    
+   
     # Control the drone based on the gesture
-    control_drone_with_gesture(hand_sign_id, bebop, current_time)
+    if not Training:
+        control_drone_with_gesture(hand_sign_id, bebop, current_time)
 
 def control_drone_with_gesture(hand_sign_id, bebop, current_time):
     global last_takeoff_time, is_flying, current_altitude
@@ -179,11 +184,15 @@ def control_drone_with_gesture(hand_sign_id, bebop, current_time):
                 bebop.fly_direct(roll =0, pitch=50, yaw = 0, vertical_movement=0, duration=1) #Forward
                 last_takeoff_time = current_time
 
-    elif hand_sign_id ==3: # Ok Gesture - Backwards
+    elif hand_sign_id == 3: # Ok Gesture - Backwards
         if is_flying:
             if current_time - last_takeoff_time > takeoff_cooldown:
                 print ("Ok - Going Backwards")
                 bebop.fly_direct(roll = 0, pitch= -50, yaw=0, vertical_movement=0, duration=1) #Backwards
+
+   
+
+
 
 # def side(processed_landmark_list, classifier, bebop, current_time):
 #     hand_sign_id = classifier(processed_landmark_list)
@@ -191,13 +200,8 @@ def control_drone_with_gesture(hand_sign_id, bebop, current_time):
 #     # Control the drone based on the gesture
 #     control_drone_with_gesture(hand_sign_id, bebop, current_time)
 
-
-
 def main():
-    dt = 0
-    frameCounter = 0
-    start_time = time.time()
-
+    drone = Initialize_drone()
     classifier = KeyPointClassifier()
     Training = False
 
@@ -208,7 +212,7 @@ def main():
     mp_drawing = mp.solutions.drawing_utils
     hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-    processing_interval = 0.1  # Process gestures every 100ms
+    processing_interval = 0.01  # Process gestures every 10ms
     last_processed_time = 0
 
     # while True:
@@ -221,6 +225,7 @@ def main():
         if key == 27:  # ESC to quit
             running = False
             break
+        
         number, Training = Get_number_pressed(key, Training)
 
 
@@ -240,8 +245,11 @@ def main():
                     draw_bounding_rect(img, brect, Training)
 
                     mp_drawing.draw_landmarks(img, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-                    logging_csv(number, Training, processed_landmark_list )
-                    threading.Thread(target=side, args=(processed_landmark_list, classifier, bebop, current_time)).start()
+
+                    if Training:
+                        logging_csv(number, processed_landmark_list )
+                
+                    threading.Thread(target=side, args=(processed_landmark_list, classifier, drone, current_time, Training)).start()
 
         # if not is_flying and (current_time - landing_start_time >= 5):
         #     print ("The drone has landed for 5 seconds. Disconnecting")
@@ -251,14 +259,10 @@ def main():
         cv2.imshow('Drone Control', img)
 
         if cv2.waitKey(1) == ord('q'):
-            bebop.disconnect(10)
+            drone.disconnect(10)
             break
 
-        frameCounter += 1
-        if (time.time() - start_time) > 2:  # Update every 2 seconds
-            dt = (time.time() - start_time) / frameCounter
-            frameCounter = 0
-            start_time = time.time()
+       
 
     webcam.stop()
     cv2.destroyAllWindows()
