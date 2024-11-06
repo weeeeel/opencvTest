@@ -1,24 +1,97 @@
 import cv2
+import csv
 import mediapipe as mp
 import time
 import numpy as np
 import itertools
-import csv
 import copy
-
-
+import threading
+from pyparrot.Bebop import Bebop
 from Model.Keypoint_classifier import KeyPointClassifier
 
-#functions------------------------------------------------------------------------------------------------------------------------------------
+# Threaded Video Capture class to ensure non-blocking camera input
+class VideoStream:
+    def __init__(self, src=0, width=320, height=240, fps=30):
+        self.stream = cv2.VideoCapture(src)
+        self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.stream.set(cv2.CAP_PROP_FPS, fps)
+        (self.grabbed, self.frame) = self.stream.read()
+        self.stopped = False
+
+    def start(self):
+        threading.Thread(target=self.update, args=()).start()
+        return self
+
+    def update(self):
+        while not self.stopped:
+            if not self.grabbed:
+                self.stop()
+            else:
+                (self.grabbed, self.frame) = self.stream.read()
+
+    def read(self):
+        return self.frame
+
+    def stop(self):
+        self.stopped = True
+        self.stream.release()
+
+# Initialize drone connection and state
+bebop = Bebop()
+print("Connecting")
+if bebop.connect(10):
+    print("Success")
+else: 
+    print ("Failure")
+
+print("Sleeping")
+bebop.smart_sleep(5)
+bebop.ask_for_state_update()
+
+# Cooldown Period between inputs
+takeoff_cooldown = 1.0  # Reduced to 1 second for faster response
+last_takeoff_time = 0
+is_flying = False  # Track if the drone is currently flying
+current_altitude = 0  # Track current altitude
+landing_start_time = 0 #Track the time when landing is initiated 
+
+# Define landing range (in cm)
+landing_range = 50  # Change this value based on your needs
+
+def Get_number_pressed(key, Training):
+    number = -1
+    if 48 <= key <= 57:  # 0 ~ 9
+        number = key - 48
+    if key == 116:  # t
+        Training = True
+    return number,  Training
+
+  # Read labels ###########################################################
+with open('Model/keypoint_classifier_label.csv',
+            encoding='utf-8-sig') as f:
+    keypoint_classifier_labels = csv.reader(f)
+    keypoint_classifier_labels = [
+        row[0] for row in keypoint_classifier_labels
+        ]
+
+# Functions for landmark processing, bounding boxes, and gestures --------------
+
+def logging_csv(number, Training, landmark_list):
+    if not Training:
+        pass
+    if Training and (0 <= number <= 9):
+        csv_path = 'Model/keypoint.csv'
+        with open(csv_path, 'a', newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([number, *landmark_list])
 
 def make_landmark_list(image, landmarks):
-
-    width , height = image.shape[1], image.shape[0]
-
+    width, height = image.shape[1], image.shape[0]
     landmark_point = []
 
     for _, landmark in enumerate(landmarks.landmark):
-
         landmark_X = min(int(landmark.x * width), width - 1)
         landmark_Y = min(int(landmark.y * height), height - 1)
         landmark_point.append([landmark_X, landmark_Y])
@@ -27,168 +100,169 @@ def make_landmark_list(image, landmarks):
 
 def normalize_Landmarks(landmark_list):
     temp_landmark_list = copy.deepcopy(landmark_list)
-
-    base_x, base_y = 0, 0
+    base_x, base_y = temp_landmark_list[0][0], temp_landmark_list[0][1]
 
     for index, landmark_point in enumerate(temp_landmark_list):
-        if index == 0:
-            base_x, base_y  = landmark_point[0], landmark_point[1]
-
         temp_landmark_list[index][0] = temp_landmark_list[index][0] - base_x
         temp_landmark_list[index][1] = temp_landmark_list[index][1] - base_y
 
-    # convert landmark list into 1d list
-    temp_landmark_list = list(
-        itertools.chain.from_iterable(temp_landmark_list))
+    temp_landmark_list = list(itertools.chain.from_iterable(temp_landmark_list))
 
-    # normalize
     max_value = max(list(map(abs, temp_landmark_list)))
 
     def normalize_(n):
-            return (n / max_value)
-    
-    temp_landmark_list = list(map(normalize_, temp_landmark_list))
+        return (n / max_value)
 
-    return temp_landmark_list
-
-def logging_csv(number, landmark_list):
-    
-    if (0 <= number <= 9):
-        csv_path = 'Model/keypoint.csv'
-        with open(csv_path, 'a', newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([number, *landmark_list])
-    return
+    return list(map(normalize_, temp_landmark_list))
 
 def make_bounding_rect(image, landmarks):
     webcam_width, webcam_height = image.shape[1], image.shape[0]
-
-    landmark_array = np.empty((0,2), int)
+    landmark_array = np.empty((0, 2), int)
 
     for _, landmark in enumerate(landmarks.landmark):
-
         landmark_X = min(int(landmark.x * webcam_width), webcam_width - 1)
         landmark_Y = min(int(landmark.y * webcam_height), webcam_height - 1)
-        
         landmark_point = [np.array((landmark_X, landmark_Y))]
-        landmark_array = np.append(landmark_array, landmark_point, axis = 0)
-    
+        landmark_array = np.append(landmark_array, landmark_point, axis=0)
+
     x, y, w, h = cv2.boundingRect(landmark_array)
     return [x, y, x + w, y + h]
 
-def draw_bounding_rect(use_brect, image, brect, training):
-    if use_brect:
-        if training:
-            cv2.rectangle(image, (brect[0], brect[1]),(brect[2], brect[3]), (0, 255, 0), 1 )
+def draw_bounding_rect(image, brect, Training):
+    if brect:
+        if Training:
+            cv2.rectangle(image, (brect[0], brect[1]), (brect[2], brect[3]), (0, 255, 0), 1)
         else:
-            cv2.rectangle(image, (brect[0], brect[1]),(brect[2], brect[3]), (0, 0, 255), 1 )
+            cv2.rectangle(image, (brect[0], brect[1]), (brect[2], brect[3]), (255, 0, 0), 1)
 
-def set_the_throttle(input):
-    return (input - 0.5)* 100
+
+def side(processed_landmark_list, classifier, bebop, current_time):
+    hand_sign_id = classifier(processed_landmark_list)
+    
+    # Control the drone based on the gesture
+    control_drone_with_gesture(hand_sign_id, bebop, current_time)
+
+def control_drone_with_gesture(hand_sign_id, bebop, current_time):
+    global last_takeoff_time, is_flying, current_altitude
+
+    if hand_sign_id == 0:  # Open Hand - Takeoff or Ascend
+        if not is_flying:  # Takeoff only if not already flying
+            if current_time - last_takeoff_time > takeoff_cooldown:
+                print('Open Hand - Takeoff')
+                bebop.safe_takeoff(10)
+                last_takeoff_time = current_time
+                is_flying = True  # Set flying status
+                current_altitude = 0  # Reset altitude on takeoff
+        else:
+            print("Open Hand - Ascending")
+            bebop.fly_direct(roll=0, pitch=0, yaw=0, vertical_movement=50, duration=1)  # Ascend
+            current_altitude += 50  # Increment altitude
+
+    elif hand_sign_id == 1:  # Closed Hand - Descend
+        if is_flying:
+            print('Closed Hand - Descending')
+            bebop.fly_direct(roll=0, pitch=0, yaw=0, vertical_movement=-50, duration=1)  # Descend
+            current_altitude -= 50  # Decrement altitude
+
+            # Check if within landing range to execute landing
+            if current_altitude <= landing_range:
+                print('Landing command executed')
+                bebop.safe_land(10)
+                landing_time = current_time #record landing start time
+                current_altitude = 0  # Reset altitude
+                is_flying = False  # Update flying status
+
+    elif hand_sign_id == 2:  # Pointing Gesture - Forward
+        if is_flying:
+            if current_time - last_takeoff_time > takeoff_cooldown:
+                print ("Pointing - Going Forward")
+                bebop.fly_direct(roll =0, pitch=50, yaw = 0, vertical_movement=0, duration=1) #Forward
+                last_takeoff_time = current_time
+
+    elif hand_sign_id ==3: # Ok Gesture - Backwards
+        if is_flying:
+            if current_time - last_takeoff_time > takeoff_cooldown:
+                print ("Ok - Going Backwards")
+                bebop.fly_direct(roll = 0, pitch= -50, yaw=0, vertical_movement=0, duration=1) #Backwards
+
+# def side(processed_landmark_list, classifier, bebop, current_time):
+#     hand_sign_id = classifier(processed_landmark_list)
+    
+#     # Control the drone based on the gesture
+#     control_drone_with_gesture(hand_sign_id, bebop, current_time)
+
+
 
 def main():
-
-    # set dt variables
-    timeBetweenDt= 2 # displays the frame rate every 2 seconds
     dt = 0
     frameCounter = 0
     start_time = time.time()
 
+    classifier = KeyPointClassifier()
+    Training = False
 
-    # crate a hand geasture classifier object
-    Classifier = KeyPointClassifier()
-    training = False
+    webcam = VideoStream(width=640, height=480, fps=15).start()
 
-    #loop every frame -------------------------------------------------------------------------------------------------------------------------
-    while True:
-        success, img = webcam.read()
+    # MediaPipe hands setup
+    mp_hands = mp.solutions.hands
+    mp_drawing = mp.solutions.drawing_utils
+    hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+
+    processing_interval = 0.1  # Process gestures every 100ms
+    last_processed_time = 0
+
+    # while True:
+    #     pass
+    running = True
+    while running:
+        img = webcam.read()
         key = cv2.waitKey(10)
 
-       
-        if key == 27:  # ESC
+        if key == 27:  # ESC to quit
+            running = False
             break
-        elif key == 116:
-            training = not training
-        
-        # Convert image to RGB for MediaPipe processing
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        results = hands.process(img_rgb)
+        number, Training = Get_number_pressed(key, Training)
 
-        #/key = keyboard.read_key()
-    
-        #if  key =='t':
-        #    training = not training
-       # else:
-        #    pass
 
-    
-        
-        # Draw hand landmarks if detected
-        if results.multi_hand_landmarks:
-            for hand_landmarks in results.multi_hand_landmarks:
+        current_time = time.time()
+        if current_time - last_processed_time > processing_interval:
+            last_processed_time = current_time
 
-    
-                #get the landmark data 
-                landmark_list = make_landmark_list(img, hand_landmarks)
-                #normalise the landmark data 
-                processed_landmark_list = normalize_Landmarks(landmark_list)
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = hands.process(img_rgb)
 
-                #calculate bounding rectangle
-                brect = make_bounding_rect(img, hand_landmarks)
-                
-                #draw landmarks
-                mp_drawing.draw_landmarks(img, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    landmark_list = make_landmark_list(img, hand_landmarks)
+                    processed_landmark_list = normalize_Landmarks(landmark_list)
 
-                #draw bounding
-                img_rgb = draw_bounding_rect(True, img, brect, training)
+                    brect = make_bounding_rect(img, hand_landmarks)
+                    draw_bounding_rect(img, brect, Training)
 
-                # hand sign classification
+                    mp_drawing.draw_landmarks(img, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                    logging_csv(number, Training, processed_landmark_list )
+                    threading.Thread(target=side, args=(processed_landmark_list, classifier, bebop, current_time)).start()
 
-                hand_sign_id = Classifier(processed_landmark_list)
-                match hand_sign_id:
-                                    case 0:
-                                        print('open')
-                                    case 1:
-                                        print('close')
-                                    case 2:
-                                        print('point')
-                                    case 3:
-                                        print('ok')
-                #print(processed_landmark_list)
+        # if not is_flying and (current_time - landing_start_time >= 5):
+        #     print ("The drone has landed for 5 seconds. Disconnecting")
+        #     bebop.disconnect()
+        #     break
 
-                #print("\n")
-                
-        
+        cv2.imshow('Drone Control', img)
 
-        
-        # output the average time between frames in ms
-        cv2.putText(img,  f'ms: {1000*dt:.2f}',  (550, 25), cv2.FONT_HERSHEY_PLAIN , 1, (255, 255, 255),  1,) 
-        
-        # Show the processed image with hand annotations 
-        cv2.imshow('Artemis', img)
-
-        # Exit if 'q' key is pressed
         if cv2.waitKey(1) == ord('q'):
-            return
-        
-        # every x amount if time show the average dt between frames 
-        frameCounter+=1
-        if (time.time() - start_time) > timeBetweenDt :
-            dt = (time.time() - start_time)/frameCounter
+            bebop.disconnect(10)
+            break
+
+        frameCounter += 1
+        if (time.time() - start_time) > 2:  # Update every 2 seconds
+            dt = (time.time() - start_time) / frameCounter
             frameCounter = 0
             start_time = time.time()
 
-    # Release the webcam and close all OpenCV windows
-    webcam.release()
+    webcam.stop()
     cv2.destroyAllWindows()
 
-#------------------------------------------------------------------------
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-
-# Initialize the Hands model outside the loop to improve efficiency
-hands = mp_hands.Hands(max_num_hands=1)
-webcam = cv2.VideoCapture(0)
-
-
-main()
+# Run the main function
+if __name__ == '__main__':
+    main()
